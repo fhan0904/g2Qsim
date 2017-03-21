@@ -13,10 +13,14 @@ include cuda.mk
 LFLAGS = -L$(CUDAPATH)/lib64 -lcuda -lcudart -lcurand -lm
 
 #ROOTCFLAGS := $(shell  $(ROOTSYS)/bin/root-config --cflags)
-ROOTCFLAGS := -m64 -I/home/daq/DAQ/root_5.30_x86_64/include
+#ROOTCFLAGS := -m64 -I/home/daq/DAQ/root_5.30_x86_64/include
+ROOTCFLAGS := -m64 -I$(ROOTSYS)/include
 ROOTCFLAGS += -DHAVE_ROOT -DUSE_ROOT
 #ROOTLIBS   := $(shell  $(ROOTSYS)/bin/root-config --libs) -Wl,-rpath,$(ROOTSYS)/lib
-ROOTLIBS   := -L/home/daq/DAQ/root_5.30_x86_64/lib -lGpad -lHist -lGraf -lGraf3d -lTree -lRint -lPostscript -lMatrix -lPhysics -lMathCore -lRIO -lNet -lThread -lCore -lCint -lm -ldl -L$(ROOTSYS)/lib
+#ROOTLIBS   := -L/home/daq/DAQ/root_5.30_x86_64/lib -lGpad -lHist -lGraf -lGraf3d -lTree -lRint -lPostscript -lMatrix -lPhysics -lMathCore -lRIO -lNet -lThread -lCore -lCint -lm -ldl -L$(ROOTSYS)/lib
+ROOTLIBS   := -lGpad -lHist -lGraf -lGraf3d -lTree -lRint -lPostscript -lMatrix -lPhysics -lMathCore -lRIO -lNet -lThread -lCore -lCint -lm -ldl -L$(ROOTSYS)/lib 
+
+
 ROOTLIBS   += -lThread
 
 #LIB      += $(ROOTLIBS)
