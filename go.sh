@@ -1,0 +1,23 @@
+#!/bin/bash
+./rand 256 100
+cp test.root test_100flushes_1a.root
+./rand 256 100
+cp test.root test_100flushes_1b.root
+./rand 256 100
+cp test.root test_100flushes_1c.root
+./rand 256 100
+cp test.root test_100flushes_1d.root
+./rand 256 100
+cp test.root test_100flushes_1e.root
+./rand 256 100
+cp test.root test_100flushes_1f.root
+./rand 256 100
+cp test.root test_100flushes_1g.root
+./rand 256 100
+cp test.root test_100flushes_1h.root
+./rand 256 100
+cp test.root test_100flushes_1i.root
+./rand 256 100
+cp test.root test_100flushes_1j.root
+./rand 256 100
+cp test.root test_100flushes_1k.root
