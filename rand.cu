@@ -17,9 +17,6 @@
 #include <TH1.h>
 #include <TH2.h>
 
-//#define NXSEG 1
-//#define NYSEG 1
-//#define NSEG 1
 #define NXSEG 9
 #define NYSEG 6
 #define NSEG 54
@@ -28,7 +25,7 @@ TFile *f;
 TH1D *hHits1D;
 TH1D *hFlush1D[NSEG];
 TH2D *hFlush2D[NSEG];
-TH2D *hFlush2DCoarse[NSEG];
+//TH2D *hFlush2DCoarse[NSEG];
 
 // timing tests                                                                       
 float toddiff(struct timeval*, struct timeval*);
@@ -58,18 +55,18 @@ __global__ void init_rand( curandState *state, unsigned long long offset, unsign
 
 __global__ void zero_int_array( int32_t *array, int length) {
 
-   int idx = blockIdx.x*256 + threadIdx.x;
-   if (idx >= length) return;
-
+  int idx = blockIdx.x*256 + threadIdx.x;
+  if (idx < length) {
     *(array + idx) = 0;
+  }
 }
 
 __global__ void zero_float_array( float *array, int length) {
 
-   int idx = blockIdx.x*256 + threadIdx.x;
-   if (idx >= length) return;
-
+  int idx = blockIdx.x*256 + threadIdx.x;
+  if (idx < length) {
     *(array + idx) = 0.0;
+  }
 }
 
 __global__ void make_rand( curandState *state, float *randArray) {
@@ -88,7 +85,7 @@ __global__ void make_randexp( curandState *state, float *randArray, float tau) {
    state[idx] = localState;
 }
 
-__global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *fillArray, int ne, int fill_buffer_max_length, int nfills, bool fillnoise) {
+__global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *fillArray, float *hitSumArray, float *fillSumArray, int ne, int fill_buffer_max_length, int nfills, bool fillnoise) {
   // single thread make complete fill with ne electrons
 
    const float tau = 6.4e4;          // ns
@@ -129,10 +126,14 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
      
      // make noise
      if (fillnoise) {
-       float noise = 0., pedestal = 0., sigma = 4.;
+       int32_t noise = 0.; 
+       float pedestal = 0., sigma = 4.;
        for (int i = 0; i < nsegs*fill_buffer_max_length; i++){
 	 noise = pedestal + sigma * curand_normal(&localState); // random from Gaussian using uniform random number 0->1
-	 *(fillArray + fill_buffer_max_length*idx + i ) = (int32_t) noise;  // fill buffer
+         // if fill-by-fill buffer
+	 //*(fillArray + fill_buffer_max_length*idx + i ) = noise;  // fill buffer
+         // if flush-by-flush buffer
+         atomicAdd( &(fillSumArray[ i ]), (float)noise ); // flush buffer
        }
      }
      
@@ -155,6 +156,7 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
        // get muon decay time     
        t = -tau * log( 1.0 - curand_uniform(&localState) ); // random from exp(-t/tau) using uniform random number 0->1
        tick = t/nsPerTick;
+       if ( ( (int)tick ) >= fill_buffer_max_length ) continue; // time out-of-bounds 
        
        // get positron energy
        y = curand_uniform(&localState);
@@ -220,7 +222,6 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
        }
      }
      
-     
      // simple pileup effect - needs work
      //float dt = 0.0, dtmin = -999999.;
      //for (int j = 0; j < i; j++){
@@ -240,7 +241,6 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
      
      for (int i = 0; i < nhit; i++){
        
-       
        // array is time-ordered
        tick = tickstore[i]; 
        // array isn't time-ordered
@@ -251,7 +251,12 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
        
        int itick = (int)tick;
        float rtick = tick - itick;
-       hitArray[itick]++; // debugging only
+
+       // hit arrays are arrays of overall calo hits (not calo segment hits) for diagnostics
+       // if using hitSumArray flush buffer
+       atomicAdd( &(hitSumArray[ itick ]), 1.0);
+       // if using hitArray flush buffer
+       //hitArray[ itick + fill_buffer_max_length*idx ]++; 
        
        for (int ix = 0; ix < nxseg; ix++) {
 	 for (int iy = 0; iy < nyseg; iy++) {
@@ -272,7 +277,12 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
 	     if ( kk < 0 || kk >= fill_buffer_max_length ) continue;
 	     int ADCfrac = ADCsegment*exp(-0.5*(k+rtick)*(k+rtick)/width/width)/gsum;
 	     if ( ADCfrac > 2048 ) ADCfrac = 2048;
-	     if ( ADCfrac >= 1 ) *(fillArray + nsegs*fill_buffer_max_length*idx + xysegmentoffset + kk ) += ADCfrac;  // fill buffer
+
+             // if using fillArray fill buffer
+	     //if ( ADCfrac >= 1 ) *(fillArray + nsegs*fill_buffer_max_length*idx + xysegmentoffset + kk ) += ADCfrac;  // fill buffer
+             // if using fillSumArray flush buffer
+	     if ( ADCfrac >= 1 ) atomicAdd( &(fillSumArray[ xysegmentoffset + kk ]), (float)ADCfrac );
+
 	   }
 	 } // y-distribution loop
        } // x-distribution loop
@@ -350,12 +360,13 @@ int main(int argc, char * argv[]){
   // Q-method arrays 
   int32_t *h_fillArray, *d_fillArray;
   float *h_fillSumArray, *d_fillSumArray; 
-  // tur hits arrays 
+  // for hits arrays 
   int32_t *h_hitArray, *d_hitArray;
   float *h_hitSumArray, *d_hitSumArray; 
 
   // define fill length, clock tick for simulation
   //const int nsPerFill = 4096, nsPerTick = 16; 
+  //const int nsPerFill = 560000, nsPerTick = 16; 
   const int nsPerFill = 560000, nsPerTick = 16; 
   int fill_buffer_max_length = nsPerFill / nsPerTick;
   int nxsegs = NXSEG, nysegs = NYSEG;
@@ -390,9 +401,9 @@ int main(int argc, char * argv[]){
     sprintf( hname, "\n hFlush1D%02i", ih);
     hFlush1D[ih] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
     sprintf( hname, "\n hFlush2D%02i", ih);
-    hFlush2D[ih] = new TH2D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length, 128, -64, 63 );
-    sprintf( hname, "\n hFlush2DCoarse%02i", ih);
-    hFlush2DCoarse[ih] = new TH2D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length, 128, 0, 2048 );
+    hFlush2D[ih] = new TH2D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length, 64, -32, 31 );
+    //sprintf( hname, "\n hFlush2DCoarse%02i", ih);
+    //hFlush2DCoarse[ih] = new TH2D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length, 128, 0, 2048 );
   }
   sprintf( hname, "\n hHits1D");
   hHits1D = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
@@ -458,6 +469,8 @@ int main(int argc, char * argv[]){
   }
 
   // host, device arrays for random, muon type fills
+  //below are for fill-by-fill arrays
+  /*
   h_randArray = (float *)malloc(nsegs*nfills*sizeof(float));
   cudaMalloc( (void **)&d_randArray, nsegs*nfills*sizeof(float));
   h_fillArray = (int32_t *)malloc(nsegs*nfills*fill_buffer_max_length*sizeof(int32_t));
@@ -469,8 +482,10 @@ int main(int argc, char * argv[]){
     printf("Cuda error in file '%s' in line %i : %s.\n",
              __FILE__, __LINE__, cudaGetErrorString( err) );
   }
+  */
 
   // host, device arrays for flushes
+  //below are for flush-by-flush arrays  
   h_fillSumArray = (float *)malloc(nsegs*fill_buffer_max_length*sizeof(float));
   cudaMalloc( (void **)&d_fillSumArray, nsegs*fill_buffer_max_length*sizeof(float));
   h_hitSumArray = (float *)malloc(fill_buffer_max_length*sizeof(float));
@@ -504,26 +519,30 @@ int main(int argc, char * argv[]){
     printf("flush %i\n", j);
 
     cudaEventRecord(start, 0);
-    /* memset on host, copy to device 
-    cudaMemcpy( d_fillArray, h_fillArray, nsegs*nfills*fill_buffer_max_length*sizeof(int32_t), cudaMemcpyHostToDevice);
-    */
-    // zero arrays for next flush
 
+    // zero arrays for next flush
     // too many blocks if size nsegs*nfills*fill_buffer_max_length
+    // fill-by-fill arrays
+
+    /*
     for (int iz = 0; iz < nfills; iz++){
       zero_int_array<<<nblocks2,nthreads>>>( &d_fillArray[iz*nsegs*fill_buffer_max_length], nsegs*fill_buffer_max_length);
+      cudaThreadSynchronize();
+      err=cudaGetLastError();
+      if(err!=cudaSuccess) {
+	printf("iz %i\n", iz);     
+	printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
+	exit(0);
+      }  
     }
-    err=cudaGetLastError();
-    if(err!=cudaSuccess) {
-      printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
-      exit(0);
-    }  
     zero_int_array<<<nblocks5,nthreads>>>( d_hitArray, nfills*fill_buffer_max_length);
     err=cudaGetLastError();
     if(err!=cudaSuccess) {
       printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
       exit(0);
-    }  
+    }
+
+    // flush-by-flush arrays 
     zero_float_array<<<nblocks2,nthreads>>>( d_fillSumArray, nsegs*fill_buffer_max_length);
     err=cudaGetLastError();
     if(err!=cudaSuccess) {
@@ -536,6 +555,8 @@ int main(int argc, char * argv[]){
       printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
       exit(0);
     }  
+    */
+
     /*
     err = cudaMemset( d_hitArray, 0, nfills*fill_buffer_max_length*sizeof(int32_t));
     if ( err != cudaSuccess ) {
@@ -547,6 +568,8 @@ int main(int argc, char * argv[]){
       printf("cudaMemset error!\n");
       return;
     }
+    */
+
     cudaMemset( d_fillSumArray, 0.0, nsegs*fill_buffer_max_length*sizeof(float));
     if ( err != cudaSuccess ) {
       printf("cudaMemset error!\n");
@@ -557,7 +580,7 @@ int main(int argc, char * argv[]){
       printf("cudaMemset error!\n");
       return;
     }
-    */
+
     cudaThreadSynchronize();
 
     cudaEventRecord(stop, 0);
@@ -566,17 +589,15 @@ int main(int argc, char * argv[]){
     if (j == 0) printf(" ::: kernel initialize fillArray %f ms\n",elapsedTime);
 
     cudaEventRecord(start, 0);
-    
-    //init_rand<<<nblocks1,nthreads>>>( d_state, time(NULL));
     //make_rand<<<nblocks1,nthreads>>>( d_state, d_randArray); // testing
     //make_randexp<<<nblocks1,nthreads>>>( d_state, d_randArray, tau); // testing
-    make_randfill<<<nblocks1,nthreads>>>( d_state, d_hitArray, d_fillArray, ne, fill_buffer_max_length, nfills, fillbyfillnoise);
+    make_randfill<<<nblocks1,nthreads>>>( d_state, d_hitArray, d_fillArray, d_hitSumArray, d_fillSumArray, ne, fill_buffer_max_length, nfills, fillbyfillnoise);
     err=cudaGetLastError();
     if(err!=cudaSuccess) {
-      printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
+      printf("Cuda failure with user kernel function %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
       exit(0);
-    }  
-
+    } 
+ 
     /*
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
@@ -596,10 +617,8 @@ int main(int argc, char * argv[]){
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&elapsedTime, start, stop);
     if (j == 0) printf(" ::: kernel make_hitsum time %f ms\n",elapsedTime);
-    */
 
     cudaEventRecord(start, 0);
-
     //init_rand<<<nblocks2,nthreads>>>( d_state2, time(NULL));
     make_fillsum<<<nblocks2,nthreads>>>( d_state2, d_fillArray, d_fillSumArray, nfills, fill_buffer_max_length, flushbyflushnoise);
     err=cudaGetLastError();
@@ -612,9 +631,7 @@ int main(int argc, char * argv[]){
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&elapsedTime, start, stop);
     if (j == 0) printf(" ::: kernel make_fillsum time %f ms\n",elapsedTime);
-
-
-    cudaEventRecord(start, 0);
+    */
 
    /*  
     cudaMemcpy( h_randArray, d_randArray, nfills*sizeof(float), cudaMemcpyDeviceToHost);
@@ -648,32 +665,30 @@ int main(int argc, char * argv[]){
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
 
+    cudaEventElapsedTime(&elapsedTime, start, stop);
+    if (j == 0) printf(" ::: kernel cuda memcpy time + fill root histograms %f ms\n",elapsedTime);
+
     for (int i = 0; i < nsegs*fill_buffer_max_length; i++){
       int ih = i / fill_buffer_max_length;
       int ib = i % fill_buffer_max_length;
       //if (ib == 0) printf("i %i, ib %i, ih %i, *(h_fillSumArray+i) %f\n", i, ib, ih, *(h_fillSumArray+i));
       hFlush1D[ih]->Fill( ib+1, *(h_fillSumArray+i));
       hFlush2D[ih]->Fill( ib+1, *(h_fillSumArray+i));
-      hFlush2DCoarse[ih]->Fill( ib+1, *(h_fillSumArray+i));
+      //hFlush2DCoarse[ih]->Fill( ib+1, *(h_fillSumArray+i));
       //fprintf(fp, " %i %f\n", i+1, *(h_fillSumArray+i) );      
     }
     for (int ib = 0; ib < fill_buffer_max_length; ib++){
       hHits1D->Fill( ib+1, *(h_hitSumArray+ib));
     }
 
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&elapsedTime, start, stop);
-    if (j == 0) printf(" ::: kernel cuda memcpy time + fill root histograms %f ms\n",elapsedTime);
-
   }
 
   // free device arrays
   cudaFree(d_state);
   cudaFree(d_state2);
-  cudaFree(d_randArray);
-  cudaFree(d_hitArray);
-  cudaFree(d_fillArray);
+  //cudaFree(d_randArray);
+  //cudaFree(d_hitArray);
+  //cudaFree(d_fillArray);
   cudaFree(d_fillSumArray);
   cudaFree(d_hitSumArray);
 
@@ -681,16 +696,18 @@ int main(int argc, char * argv[]){
   gettimeofday(&end_time, NULL);
   printf("elapsed processing time, dt %f secs\n", toddiff(&end_time, &start_time));
 
+
   f = new TFile("test.root","recreate");
+  printf("write histograms\n"); 
   for (int ih = 0; ih < nsegs; ih++) {
     //int ih = 0;
-    //printf("writing segment %i\n", ih);
+    printf("writing segment %i\n", ih);
     sprintf( hname, "h%02i", ih);
     f->WriteObject( hFlush1D[ih], hname);
     sprintf( hname, "s%02i", ih);
     f->WriteObject( hFlush2D[ih], hname);
-    sprintf( hname, "sc%02i", ih);
-    f->WriteObject( hFlush2DCoarse[ih], hname);
+    //sprintf( hname, "sc%02i", ih);
+    //f->WriteObject( hFlush2DCoarse[ih], hname);
     //f->WriteObject( hFlush2DCourse, "hFlush2DCourse");
   }
   sprintf( hname, "hHits");
