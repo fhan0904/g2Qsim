@@ -24,6 +24,8 @@
 
 // Qmethod parameters
 #define TIMEDECIMATION 16
+#define GEVTOADC  2048./6.2
+#define  PEAKBINFRAC  0.4
 
 // simulator parameters
 #define NEMAX 5000 // max electrons per fill per calo
@@ -33,8 +35,8 @@
 TFile *f;
 
 // output histograms
-TH1D *hHits1D, *hEnergy1D; // diagnostics histograms of truth hit time, energy distributions
-TH1D *hFlush1D[NSEG*NTMAX], *hFlush1Dlost[NSEG*NTMAX]; // per xtal, 1D q-method time distributions (above / below threshold setting) 
+TH1D *hHits1D, *hPUHits1D, *hEnergy1D, *hPUlostEnergy1D, *hPUgainEnergy1D; // diagnostics histograms of truth hit time, energy distributions
+TH1D *hFlush1D[NSEG*NTMAX], *hFlush1Dlost[NSEG*NTMAX], *hStats1D[NSEG*NTMAX]; // per xtal, 1D q-method time distributions (above / below threshold setting) 
 TH2D *hFlush2D[NSEG], *hFlush2DCoarse[NSEG]; // per xtal, 2D q-method time distribution
 TH2D *hFlush2DSum, *hFlush2DCoarseSum; // per calo, 2D q-method time distribution
 
@@ -123,16 +125,17 @@ __global__ void make_randexp( curandState *state, float *randArray, float tau) {
 /*
 GPU kernel user function to build each fills time distribution
 */
-__global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *fillArray, float *hitSumArray, float *fillSumArray,  float *energySumArray, int ne, int fill_buffer_max_length, int nfills, bool fillnoise) {
+__global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *fillArray, float *hitSumArray, float *PUhitSumArray, float *fillSumArray,  float *energySumArray, float *PUlostenergySumArray, float *PUgainenergySumArray, int ne, int fill_buffer_max_length, int nfills, bool fillnoise) {
 
   // single thread make complete fill with ne electrons
 
    const float tau = 6.4e4;                              // muon time-dilated lifetime (ns)
    const float omega_a = 1.438e-3;                       // muon anomalous precession frequency (rad/ns)
    const float magicgamma = 29.3;                        // gamma factor for magic momentum 3.094 GeV/c
-   const int GeVToADC = 2048./6.2;                       // energy-ADC counts conversion (ADC counts / energy GeV)
+   const float GeVToADC = GEVTOADC;                      // energy-ADC counts conversion (ADC counts / energy GeV)
+   const float peakBinFrac = PEAKBINFRAC;                // fraction of calo pulse in single 800 MHz digitizer bin
    const int nsPerTick = TIMEDECIMATION*1000/800;        // Q-method histogram bin size (ns), accounts for 800MHz sampling rate
-   const float Elab_max = 3.1;                           // GeV, maximum positron lab energy
+   const float Elab_max = 3.095;                         // GeV, maximum positron lab energy
    const float Pi = 3.1415926;                           // Pi
    const float cyclotronperiod = 149.0/nsPerTick;        // cyclotron period in histogram bin units
    const float anomalousperiod = 4370./nsPerTick;        // anomalous period omega_c-omega_s in histogram bin units
@@ -149,6 +152,13 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
    float p7 =       131393;
    float p8 =       -78343;
    float p9 =      19774.1;
+
+   // parameters to mimic first-order pileup in T-method (no spatial resolution of pulse pileup)
+   float PUtick, prevtick, prevADC; // mimic T-method pileup
+   float PUdt = 10.0/nsPerTick; // convert from ns to clock ticks
+   float PUth = 1.8*GeVToADC/peakBinFrac; // convert from GeV to ADC value
+   //PUdt = 0.0/nsPerTick; // switch off PU
+   //PUth = 0.0*GeVToADC/peakBinFrac; // switch off PU
 
    // variables for muon decay / kinematics 
    float t, y, A, n;   // mu-decay parameters
@@ -201,27 +211,51 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
        if ( ( (int)tick ) >= fill_buffer_max_length ) continue; // time out-of-bounds 
        
        // Get positron lab energy. Obtained by generating the position energy, angle distribution in muon rest frame
+
+       /*
+       // original version with calculation done in muon rest frame
        y = curand_uniform(&localState);
        A = (2.0*y - 1)/(3.0 - 2.0*y);
        n = y*y*(3.0 - 2.0*y);
-       r_test = n*(1.0-A*cos(omega_a*t))*0.5;
+       r_test = n*(1.0-A*cos(omega_a*t))*0.5; 
        r = curand_uniform(&localState);  
        if ( r >= r_test ) continue;
 
-       theta = Pi*curand_uniform(&localState);  // check me
-       float Elab = 0.5 *Elab_max * y * ( 1.0 + cos(theta));  // boost to lab frame
+       theta = Pi*curand_uniform(&localState); 
+       float Elab = 0.5 *Elab_max * y * ( 1.0 + cos(theta)); 
+       */
+
+       // new version with calculation done in muon rest frame
+       y = curand_uniform(&localState);
+       A = (-8.0*y*y + y + 1.)/( y*y - 5.*y - 5.);
+       n = (y - 1)*( y*y - 5.*y - 5.);
+       r_test = n*(1.-A*cos(omega_a*t))/6.; 
+       r = curand_uniform(&localState);  
+       if ( r >= r_test ) continue;
+
+       float Elab = Elab_max*y;
 
        // Account for acceptance of calorimeter using empirical, energy-dependent calo acceptance
        // for now a very simple empirical acceptance, zero below ElabMin, unit above ElabMin
-       float ElabMin = 0.5;
-       ///if (Elab < ElabMin) continue;
+
+       //float ElabMin = 0.5; // acceptance cutoff
+       //if (Elab < ElabMin) continue;
+
+       // simple acceptance paramterization from Aaron see Experiments/g-2/Analysis/Qmethod/functionForTim.C
+       if (Elab > 0.7*Elab_max) {
+	 r_test = 1.0;
+       } else {
+	 r_test = Elab/(0.7*Elab_max);
+       }
+       r = curand_uniform(&localState);  
+       if ( r >= r_test ) continue;
 
        // Variable ADC is total ADC samples of positron signal at 800 MMz sampling rate with 6.2 GeV max range over 2048 ADC counts
        ADC = GeVToADC*Elab; 
 
        // Divide by maximum fraction of positron signal in single 800 MHz bin (is ~0.4 from erfunc plot of 5ns FWHM pulse 
        // in peak sample at 800 MHz sampling rate
-       ADC = ADC/0.4; 
+       ADC = ADC/peakBinFrac; 
 
        // Add empirical energy-dependent drift time, see https://muon.npl.washington.edu/elog/g2/Simulation/229 
        // using empirical distribution for relation between energy and time
@@ -230,7 +264,6 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
 	 + p5*ylab*ylab*ylab*ylab*ylab + p6*ylab*ylab*ylab*ylab*ylab*ylab + p7*ylab*ylab*ylab*ylab*ylab*ylab*ylab 
 	 + p8*ylab*ylab*ylab*ylab*ylab*ylab*ylab*ylab + p9*ylab*ylab*ylab*ylab*ylab*ylab*ylab*ylab*ylab; // phase in mSR units of omega_a
        drifttime = anomalousperiod * phase / (2.*Pi*1000.); // convert the omega_a phase to drift time in Q-method histogram bin units
-
        tick = tick + drifttime;
        
        // generate the x, y coordinates of positron hit on calorimeter
@@ -256,7 +289,8 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
 
        // hit arrays are arrays of xtal-summed calo hits (not individual xtal hits) for diagnostics
        // if using hitSumArray flush buffer
-       atomicAdd( &(hitSumArray[ itick ]), 1.0);
+       //atomicAdd( &(hitSumArray[ itick ]), 1.0);
+       if ( ADC > PUth ) atomicAdd( &(hitSumArray[ itick ]), 1.0);
        // if using hitArray flush buffer
        //hitArray[ itick + fill_buffer_max_length*idx ]++; 
 
@@ -332,7 +366,7 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
      float ADCnorm = 812;
 
      float ADCstoresegment[54][NEMAX]; // array used for xtal-by-xtal pileup effects
-
+ 
      // loop over time-ordered positron hits
      for (int i = 0; i < nhit; i++){
        
@@ -343,6 +377,47 @@ __global__ void make_randfill( curandState *state, int32_t *hitArray, int32_t *f
        xcoord = xcoordstore[iold[i]];
        ycoord = ycoordstore[iold[i]];
 
+
+       // PU hit arrays are arrays of xtal-summed calo hits (not individual xtal hits) for diagnostics
+       // that include a pile-up time window and a energy threshold and mimic a simple T-method.
+       // handles double pile-up, not triple pileup, etc
+       if (i == 0 ) {
+
+	 if ( ADC > PUth ) atomicAdd( &(PUhitSumArray[ (int)tick ]), +1.0); // add first hit if above threshold
+	 //printf("fill %i, first hit i %i, t_i %f, A_i, %f \n", idx, i, tick, ADC);
+       } else {
+
+	 prevtick = tickstore[i-1]; 
+	 
+	 if ( tick-prevtick < PUdt ){
+           
+	   // pile-up in time
+	   prevADC = ADCstore[iold[i-1]]; 
+           PUtick = ( prevADC*prevtick + ADC*tick )/( prevADC + ADC );
+	   //printf("pileup: fill %i, hit %i t = %f, hit %i, t = %f\n", idx, i-1, prevtick, i, tick);
+           // build array of energy of losses / gains of hits due to pileup
+	   if ( (prevADC + ADC) > PUth ) { 
+	     atomicAdd( &(PUlostenergySumArray[ (int)prevADC ]), +1.0);
+	     atomicAdd( &(PUlostenergySumArray[ (int)ADC ]), +1.0);
+	     atomicAdd( &(PUgainenergySumArray[ (int)(prevADC+ADC) ]), +1.0);
+	   }
+	   if ( prevADC > PUth ) {
+	     atomicAdd( &(PUhitSumArray[ (int)prevtick ]), -1.0); // remove previous hit if above threshold
+	     //printf("remove pile-up hit: fill %i, %i, time %f, ADC %f, thres %f\n", idx, i-1, prevtick, prevADC, PUth);
+	   }
+ 	   if ( (prevADC + ADC) > PUth ) {
+	     atomicAdd( &(PUhitSumArray[ (int)PUtick ]), +1.0); // add pileup hit if above threshold
+	     //printf("add pile-up hit: fill %i, %i, time %f, ADC %f, thres %f\n", idx, i, PUtick, prevADC+ADC, PUth);
+	   }
+           //printf("fill %i, ith hit %i, t_i-1, t_i, t_PU, %f, %f, %f, A_i-1, A_i, A_PU, %f, %f, %f, PUdt %f, PUth %f\n", 
+	   //		  idx, i, prevtick, tick, PUtick, prevADC, ADC, prevADC+ADC, PUdt, PUth);
+	 } else {
+	   
+	   //printf("fill %i, ith hit i %i, t_i %f, A_i, %f, thres %f\n", idx, i, tick, ADC, PUth);
+	   if ( ADC > PUth ) atomicAdd( &(PUhitSumArray[ (int)tick ]), +1.0); // if no-pileup add current hit if above threshold
+	 }
+       }
+ 
        // itick is bin of q-method time histogram
        // rtick is time within bin of q-method time histogram
        int itick = (int)tick;
@@ -531,7 +606,7 @@ __global__ void make_energysum( int32_t *energyArray, float *energySumArray, int
 main program
 
 usage
-./rand ne nfills nflushes threshold 
+./rand ne nfills nflushes thresholdinterval thresholdnumber 
 
 where arguments are number of electrons in fill, number of fills in flush, number of flushes in run, and threshold
 applied at flush level
@@ -559,18 +634,24 @@ int main(int argc, char * argv[]){
   // for hits arrays 
   int32_t *h_hitArray, *d_hitArray;
   float *h_hitSumArray, *d_hitSumArray; 
+  // for PU hits arrays 
+  float *h_PUhitSumArray, *d_PUhitSumArray; 
   // for energy array
   int32_t *h_energyArray, *d_energyArray;
   float *h_energySumArray, *d_energySumArray; 
+  // for PU energy array
+  float *h_PUlostenergySumArray, *d_PUlostenergySumArray; 
+  float *h_PUgainenergySumArray, *d_PUgainenergySumArray; 
 
   // define fill length, clock tick for simulation
   //const int nsPerFill = 4096, nsPerTick = 16; 
   //const int nsPerFill = 560000, nsPerTick = 16; 
   const int nsPerFill = 560000, nsPerTick = TIMEDECIMATION*1000/800; 
+  const float  GeVToADC = GEVTOADC, PeakBinFrac = PEAKBINFRAC;
 
   int fill_buffer_max_length = nsPerFill / nsPerTick; // fill length in unit of hostogram bins
   int nxsegs = NXSEG, nysegs = NYSEG, nsegs = NSEG; // calo segmentation parameters
-  int energybins = 4096; // number of energy histogram bins
+  int energybins = 8192; // number of energy histogram bins
  
   // define run, flush, fill structure from command line arguments
   printf("number of argurments of command %i\n", argc); 
@@ -602,8 +683,8 @@ int main(int argc, char * argv[]){
   // divide by 24 for per calorimeter rate. 
   ne = ne / 24;
 
-  printf("nsegments per calo %d, ne per fill per calo %d, nfills per flush %d, nflushes per run %d, flush-level threshold interval %f, threshold number %d\n", 
-	 nsegs, ne, nfills, nflushes, threshold, nthresholds);
+  printf("nsegments per calo %d, ne per fill per calo %d, nfills per flush %d, nflushes per run %d, flush-level threshold interval (GeV) %f (%f), threshold number %d\n", 
+	 nsegs, ne, nfills, nflushes, threshold, threshold/GeVToADC, nthresholds);
 
   // define grid structure for run, flush, fill structure 
   nblocks1 = nfills / nthreads + 1;
@@ -628,6 +709,8 @@ int main(int argc, char * argv[]){
 
       sprintf( hname, "\n hFlush1D%02i_%02i", ih, it);
       hFlush1D[ih*nthresholds + it] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
+      sprintf( hname, "\n hStats1D%02i_%02i", ih, it);
+      hStats1D[ih*nthresholds + it] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
       sprintf( hname, "\n hFlush1Dlost%02i_%02i", ih, it);
       hFlush1Dlost[ih*nthresholds + it] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
     }
@@ -640,8 +723,14 @@ int main(int argc, char * argv[]){
 
   sprintf( hname, "\n hHits1D");
   hHits1D = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
+  sprintf( hname, "\n hPUHits1D");
+  hPUHits1D = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
   sprintf( hname, "\n hEnergy1D");
   hEnergy1D = new TH1D( hname, hname, energybins, 0.0, energybins );
+  sprintf( hname, "\n hPUlostEnergy1D");
+  hPUlostEnergy1D = new TH1D( hname, hname, energybins, 0.0, energybins );
+  sprintf( hname, "\n hPUgainEnergy1D");
+  hPUgainEnergy1D = new TH1D( hname, hname, energybins, 0.0, energybins );
   sprintf( hname, "\n hFlush2DSum");
   hFlush2DSum = new TH2D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length, 64, -32, 31 );
   sprintf( hname, "\n hFlush2DCoarseSum");
@@ -700,8 +789,14 @@ int main(int argc, char * argv[]){
   cudaMalloc( (void **)&d_fillSumArray, nsegs*fill_buffer_max_length*sizeof(float));
   h_hitSumArray = (float *)malloc(fill_buffer_max_length*sizeof(float));
   cudaMalloc( (void **)&d_hitSumArray, fill_buffer_max_length*sizeof(float));
+  h_PUhitSumArray = (float *)malloc(fill_buffer_max_length*sizeof(float));
+  cudaMalloc( (void **)&d_PUhitSumArray, fill_buffer_max_length*sizeof(float));
   h_energySumArray = (float *)malloc(energybins*sizeof(float));
   cudaMalloc( (void **)&d_energySumArray, energybins*sizeof(float));
+  h_PUlostenergySumArray = (float *)malloc(energybins*sizeof(float));
+  cudaMalloc( (void **)&d_PUlostenergySumArray, energybins*sizeof(float));
+  h_PUgainenergySumArray = (float *)malloc(energybins*sizeof(float));
+  cudaMalloc( (void **)&d_PUgainenergySumArray, energybins*sizeof(float));
   err = cudaThreadSynchronize();
   if ( cudaSuccess != err ) {
     printf("Cuda error in file '%s' in line %i : %s.\n",
@@ -749,7 +844,22 @@ int main(int argc, char * argv[]){
       printf("cudaMemset error!\n");
       return 1;
     }
+    cudaMemset( d_PUhitSumArray, 0.0, fill_buffer_max_length*sizeof(float));
+    if ( err != cudaSuccess ) {
+      printf("cudaMemset error!\n");
+      return 1;
+    }
     cudaMemset( d_energySumArray, 0.0, energybins*sizeof(float));
+    if ( err != cudaSuccess ) {
+      printf("cudaMemset error!\n");
+      return 1;
+    }
+    cudaMemset( d_PUlostenergySumArray, 0.0, energybins*sizeof(float));
+    if ( err != cudaSuccess ) {
+      printf("cudaMemset error!\n");
+      return 1;
+    }
+    cudaMemset( d_PUgainenergySumArray, 0.0, energybins*sizeof(float));
     if ( err != cudaSuccess ) {
       printf("cudaMemset error!\n");
       return 1;
@@ -765,8 +875,8 @@ int main(int argc, char * argv[]){
 
     // make the fills within the flush
     cudaEventRecord(start, 0);
-    make_randfill<<<nblocks1,nthreads>>>( d_state, d_hitArray, d_fillArray, d_hitSumArray, d_fillSumArray, 
-					  d_energySumArray, ne, fill_buffer_max_length, nfills, fillbyfillnoise);
+    make_randfill<<<nblocks1,nthreads>>>( d_state, d_hitArray, d_fillArray, d_hitSumArray, d_PUhitSumArray, d_fillSumArray, 
+					  d_energySumArray, d_PUlostenergySumArray, d_PUgainenergySumArray, ne, fill_buffer_max_length, nfills, fillbyfillnoise);
     err=cudaGetLastError();
     if(err!=cudaSuccess) {
       printf("Cuda failure with user kernel function %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
@@ -801,6 +911,16 @@ int main(int argc, char * argv[]){
     cudaEventSynchronize(stop);
 
     cudaEventRecord(start, 0);
+    cudaMemcpy( h_PUhitSumArray, d_PUhitSumArray, fill_buffer_max_length*sizeof(float), cudaMemcpyDeviceToHost);
+    err=cudaGetLastError();
+    if(err!=cudaSuccess) {
+      printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
+      exit(0);
+    }  
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+
+    cudaEventRecord(start, 0);
     cudaMemcpy( h_energySumArray, d_energySumArray, energybins*sizeof(float), cudaMemcpyDeviceToHost);
     err=cudaGetLastError();
     if(err!=cudaSuccess) {
@@ -809,6 +929,27 @@ int main(int argc, char * argv[]){
     }  
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
+
+    cudaEventRecord(start, 0);
+    cudaMemcpy( h_PUlostenergySumArray, d_PUlostenergySumArray, energybins*sizeof(float), cudaMemcpyDeviceToHost);
+    err=cudaGetLastError();
+    if(err!=cudaSuccess) {
+      printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
+      exit(0);
+    }  
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+
+    cudaEventRecord(start, 0);
+    cudaMemcpy( h_PUgainenergySumArray, d_PUgainenergySumArray, energybins*sizeof(float), cudaMemcpyDeviceToHost);
+    err=cudaGetLastError();
+    if(err!=cudaSuccess) {
+      printf("Cuda failure %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
+      exit(0);
+    }  
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+
 
     // measure time for copying the flush from GPU to  CPU
     cudaEventElapsedTime(&elapsedTime, start, stop);
@@ -827,6 +968,7 @@ int main(int argc, char * argv[]){
 
 	if ( *(h_fillSumArray+i) >= it*threshold) {
 	  hFlush1D[ih*nthresholds + it]->Fill( ib+1, *(h_fillSumArray+i));
+	  hStats1D[ih*nthresholds + it]->Fill( ib+1, 1);
 	} else {
 	  hFlush1Dlost[ih*nthresholds + it]->Fill( ib+1, *(h_fillSumArray+i));
 	}
@@ -854,9 +996,24 @@ int main(int argc, char * argv[]){
       hHits1D->Fill( ib+1, *(h_hitSumArray+ib));
     }
 
+    // fill diagnostic hit distribution
+    for (int ib = 0; ib < fill_buffer_max_length; ib++){
+      hPUHits1D->Fill( ib+1, *(h_PUhitSumArray+ib));
+    }
+
     // fill diagnostic energy distribution
     for (int ib = 0; ib < energybins; ib++){
       hEnergy1D->Fill( ib+1, *(h_energySumArray+ib));
+    }
+
+    // fill diagnostic PU energy distribution
+    for (int ib = 0; ib < energybins; ib++){
+      hPUlostEnergy1D->Fill( ib+1, *(h_PUlostenergySumArray+ib));
+    }
+
+    // fill diagnostic PU energy distribution
+    for (int ib = 0; ib < energybins; ib++){
+      hPUgainEnergy1D->Fill( ib+1, *(h_PUgainenergySumArray+ib));
     }
 
   }
@@ -866,7 +1023,10 @@ int main(int argc, char * argv[]){
   cudaFree(d_state2);
   cudaFree(d_fillSumArray);
   cudaFree(d_hitSumArray);
+  cudaFree(d_PUhitSumArray);
   cudaFree(d_energySumArray);
+  cudaFree(d_PUlostenergySumArray);
+  cudaFree(d_PUgainenergySumArray);
 
   // time elapsed for gnerating the entire run 
   gettimeofday(&end_time, NULL);
@@ -874,7 +1034,7 @@ int main(int argc, char * argv[]){
 
   // open root file and write root hostograms
   Char_t fname[256];
-  sprintf( fname, "root/threshold-qmethod-thres%03i-ne%05i-nfill%05i-nflush%05i.root", (int)threshold, ne, nfills, nflushes);
+  sprintf( fname, "root/threshold-qmethod-mimicT-thres%03i-ne%05i-nfill%05i-nflush%05i.root", (int)threshold, ne, nfills, nflushes);
   f = new TFile(fname,"recreate");
   printf("write histograms\n"); 
 
@@ -885,6 +1045,8 @@ int main(int argc, char * argv[]){
       
       sprintf( hname, "h%02i_%02i", ih, it);
       f->WriteObject( hFlush1D[ih*nthresholds + it], hname);
+      sprintf( hname, "hStats%02i_%02i", ih, it);
+      f->WriteObject( hStats1D[ih*nthresholds + it], hname);
       sprintf( hname, "hlost%02i_%02i", ih, it);
       f->WriteObject( hFlush1Dlost[ih*nthresholds + it], hname);
     }
@@ -897,8 +1059,14 @@ int main(int argc, char * argv[]){
 
   sprintf( hname, "hHits");
   f->WriteObject( hHits1D, hname);
+  sprintf( hname, "hPUHits");
+  f->WriteObject( hPUHits1D, hname);
   sprintf( hname, "hEnergy");
   f->WriteObject( hEnergy1D, hname);
+  sprintf( hname, "hPUlostEnergy");
+  f->WriteObject( hPUlostEnergy1D, hname);
+  sprintf( hname, "hPUgainEnergy");
+  f->WriteObject( hPUgainEnergy1D, hname);
   sprintf( hname, "sSum");
   f->WriteObject( hFlush2DSum, hname);
   sprintf( hname, "scSum");
