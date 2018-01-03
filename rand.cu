@@ -36,7 +36,7 @@ TFile *f;
 
 // output histograms
 TH1D *hHits1D, *hPUHits1D, *hEnergy1D, *hPUlostEnergy1D, *hPUgainEnergy1D; // diagnostics histograms of truth hit time, energy distributions
-TH1D *hFlush1D[NSEG*NTMAX], *hFlush1Dlost[NSEG*NTMAX], *hStats1D[NSEG*NTMAX]; // per xtal, 1D q-method time distributions (above / below threshold setting) 
+TH1D *hFlush1D[NSEG*NTMAX], *hLastFlush1D[NSEG*NTMAX], *hNextLastFlush1D[NSEG*NTMAX], *hPUFlush1D[NSEG*NTMAX], *hFlush1Dlost[NSEG*NTMAX], *hStats1D[NSEG*NTMAX], *htmp[NSEG*NTMAX]; // per xtal, 1D q-method time distributions (above / below threshold setting)
 TH2D *hFlush2D[NSEG], *hFlush2DCoarse[NSEG]; // per xtal, 2D q-method time distribution
 TH2D *hFlush2DSum, *hFlush2DCoarseSum; // per calo, 2D q-method time distribution
 
@@ -562,6 +562,47 @@ __global__ void make_fillsum( curandState *state, int32_t *fillArray, float *fil
 }
 
 /*
+GPU kernel function - builds fillSumArray from fillArray if fillArray is used and introduces noise at flush-level
+*/
+__global__ void add_flushnoise( curandState *state, float *fillSumArray, int nfills, int fill_buffer_max_length) {
+
+  // thread index
+  int idx = blockIdx.x*256 + threadIdx.x;
+  curandState localState = state[idx];
+
+  const int nxsegs = NXSEG, nysegs = NYSEG, nsegs = NSEG;
+  const int nsPerTick = TIMEDECIMATION*1000/800;        // Q-method histogram bin size (ns), accounts for 800MHz sampling rate
+  
+  // fill_buffer_max_length is Q-method bins per segment per fill
+  if (idx < nsegs * fill_buffer_max_length) {
+
+    int iseg = idx / fill_buffer_max_length;
+    int ibin = idx % fill_buffer_max_length;
+
+    // for parameter values see ~/Experiments/g-2/Analysis/June2017/tailstats.ods
+    float shrt_tau = 14000./nsPerTick; // shrt pedestal lifetime ns->ticks 
+    float long_tau = 77000./nsPerTick; // long pedestal lifetime ns->ticks
+    float shrt_ampl = 9.1; // amplitude of shrt pedestal lifetime at t=0 in ADC counts per single fill
+    float long_ampl = 2.7; // amplitude of long pedestal lifetime at t=0 in ADC counts per single fill
+    shrt_ampl = shrt_ampl*TIMEDECIMATION;
+    long_ampl = long_ampl*TIMEDECIMATION;
+
+    // add pedestal and statistical noise at flush level
+
+    float prodtocom = -1.0; // commissioning to production run normalization factor of pedestal variation per fill (note sign)
+    //float prodtocom = -0.17; // commissioning to production run normalization factor of pedestal variation per fill (note sign)
+    //float prodtocom = 0.0; // commissioning to production run normalization factor of pedestal variation per fill
+    float pedestal = prodtocom * nfills * ( shrt_ampl*exp(-float(ibin)/shrt_tau) + long_ampl*exp(-float(ibin)/long_tau) ); // xtal independent 
+    float sigma = sqrt((float)nfills)*4.0; // parameters of noise at flush level, noise per single fill to noise per nfill flush
+    //float noise = pedestal + sigma * curand_normal(&localState); // random from Gaussian using uniform random number 0->1
+    float noise = pedestal; // just pedestal
+    *(fillSumArray + idx) += noise;  // fill buffer
+    state[idx] = localState;
+    
+  }
+}
+
+/*
 GPU kernel function - builds hitSumArray from hitArray if hitArray is used
 */
 __global__ void make_hitsum( int32_t *hitArray, float *hitSumArray, int nfills, int fill_buffer_max_length, bool flushnoise) {
@@ -709,16 +750,24 @@ int main(int argc, char * argv[]){
 
       sprintf( hname, "\n hFlush1D%02i_%02i", ih, it);
       hFlush1D[ih*nthresholds + it] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
+      sprintf( hname, "\n hPUFlush1D%02i_%02i", ih, it);
+      hPUFlush1D[ih*nthresholds + it] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
+      sprintf( hname, "\n hLastFlush1D%02i_%02i", ih, it);
+      hLastFlush1D[ih*nthresholds + it] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
+      sprintf( hname, "\n htmp%02i_%02i", ih, it);
+      htmp[ih*nthresholds + it] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
+      sprintf( hname, "\n hNextLastFlush1D%02i_%02i", ih, it);
+      hNextLastFlush1D[ih*nthresholds + it] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
       sprintf( hname, "\n hStats1D%02i_%02i", ih, it);
       hStats1D[ih*nthresholds + it] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
       sprintf( hname, "\n hFlush1Dlost%02i_%02i", ih, it);
       hFlush1Dlost[ih*nthresholds + it] = new TH1D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length );
     }
 
-    sprintf( hname, "\n hFlush2D%02i", ih);
-    hFlush2D[ih] = new TH2D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length, 64, -32, 31 );
-    sprintf( hname, "\n hFlush2DCoarse%02i", ih);
-    hFlush2DCoarse[ih] = new TH2D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length, 256, 0, 8192 );
+    //sprintf( hname, "\n hFlush2D%02i", ih);
+    //hFlush2D[ih] = new TH2D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length, 64, -32, 31 );
+    //sprintf( hname, "\n hFlush2DCoarse%02i", ih);
+    //hFlush2DCoarse[ih] = new TH2D( hname, hname, fill_buffer_max_length, 0.0, fill_buffer_max_length, 256, 0, 8192 );
   }
 
   sprintf( hname, "\n hHits1D");
@@ -740,7 +789,7 @@ int main(int argc, char * argv[]){
   // switch to do fill-by-fill noise
   bool fillbyfillnoise = false; 
   // switch to do flush-by-flush noise
-  bool flushbyflushnoise = false; 
+  bool flushbyflushnoise = true; 
 
   // set device number for GPU
   int num_devices, device;
@@ -825,6 +874,9 @@ int main(int argc, char * argv[]){
   struct timeval start_time, end_time;
   gettimeofday(&start_time, NULL);
 
+  // variables for building the pile-up subtraction histogram
+  double PUadd1, PUadd2, PUsub, PUcorr;
+
   // loop over flushes in ruhn
   for (int j = 0; j < nflushes; j++){
 
@@ -879,15 +931,30 @@ int main(int argc, char * argv[]){
 					  d_energySumArray, d_PUlostenergySumArray, d_PUgainenergySumArray, ne, fill_buffer_max_length, nfills, fillbyfillnoise);
     err=cudaGetLastError();
     if(err!=cudaSuccess) {
-      printf("Cuda failure with user kernel function %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
+      printf("Cuda failure with user kernel function make)randfill %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
       exit(0);
     } 
 
-    // measure time for making fliss with single flush
+    // measure time for making flush
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&elapsedTime, start, stop);
     if (j == 0) printf(" ::: kernel make_randfill time %f ms\n",elapsedTime);
+
+    // make the fills within the flush
+    cudaEventRecord(start, 0);
+    add_flushnoise<<<nblocks2,nthreads>>>( d_state, d_fillSumArray, nfills, fill_buffer_max_length);
+    err=cudaGetLastError();
+    if(err!=cudaSuccess) {
+      printf("Cuda failure with user kernel function add_flushnoise %s:%d: '%s'\n",__FILE__,__LINE__,cudaGetErrorString(err));
+      exit(0);
+    } 
+
+    // measure time for add noise / pedestal to flush
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsedTime, start, stop);
+    if (j == 0) printf(" ::: kernel add_flushnoise time %f ms\n",elapsedTime);
 
     // copy the flush from GPU to CPU
     cudaEventRecord(start, 0);
@@ -950,74 +1017,172 @@ int main(int argc, char * argv[]){
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
 
-
-    // measure time for copying the flush from GPU to  CPU
+    // measure time for copying the flush from GPU to CPU
     cudaEventElapsedTime(&elapsedTime, start, stop);
     if (j == 0) printf(" ::: kernel cuda memcpy time for flush array ms\n",elapsedTime);
-
+      
     // add flush to run root histograms
-    for (int i = 0; i < nsegs*fill_buffer_max_length; i++){
-
-      int ih = i / fill_buffer_max_length;
-      int ib = i % fill_buffer_max_length;
-      //if (ib == 0) printf("i %i, ib %i, ih %i, *(h_fillSumArray+i) %f\n", i, ib, ih, *(h_fillSumArray+i));
-
-      for (int it = 0; it < nthresholds; it++) {
+    for (int i = 0; i < nsegs*fill_buffer_max_length; i++){ // loop over xtals x samples
+      
+      int ih = i / fill_buffer_max_length; // xtal number
+      int ib = i % fill_buffer_max_length; // sample number
+      
+      for (int it = 0; it < nthresholds; it++) { // loop over threshold values
 	
-	//if (ib == 0) printf("hFlush1D: fill ih, it, ih + nthresholds*i) %i, %i, %i\n", ih, it, ih*nthresholds + it);
+	int kmin = 3, kmax = 3; // bookending parameters for rolling average calc
+	double yaverage = 0.0, ysum = 0.0, ydiff = 0.0; // other paraters in rolling average calc
+	if ( (ib >= kmin) && (ib <= fill_buffer_max_length-kmax-1) ) { // do bookending of histogramming that's needed for rolling average
 
-	if ( *(h_fillSumArray+i) >= it*threshold) {
-	  hFlush1D[ih*nthresholds + it]->Fill( ib+1, *(h_fillSumArray+i));
-	  hStats1D[ih*nthresholds + it]->Fill( ib+1, 1);
-	} else {
-	  hFlush1Dlost[ih*nthresholds + it]->Fill( ib+1, *(h_fillSumArray+i));
-	}
-      }
+	  // sum samples in rolling window of -kmin to +kmax around sample i and calc average  
+	  for (unsigned int k = i-kmin; k <= i+kmax; k++) if ( k != i ) ysum += *(h_fillSumArray+k);                                      
+	  yaverage = ysum / ( kmin + kmax );
+	  
+	  // difference of ith sample from rolling average
+	  ydiff = *(h_fillSumArray+i) - yaverage;
+	  
+	  // make pileup correction histograms
+	  
+	  /* 
+	     categories of curremt / prior fill hits
+	     
+	     1) if the only non-zero energy hit is current fill then PUSub = PUadd1 and PUadd2 = 0 and therefore no change 
+	     in PU histogram contents as PUAdd1 is added then subtracted
+	     
+	     2) if the only non-zero energy hit is prior fill then PUSub = PUadd2 and PUadd1 = 0 and therefore no change 
+	     in PU histogram contents as PUAdd2 is added then subtracted
+	     
+	     3) if  non-zero energy hits in current fill and prior fill then there is a change in the contents of the PU
+	     histogram if one or both hits are below threshold and sum is above threshold (there's no change if both 
+	     individual hits were above the threshold).
+	     
+	     the time dependent pedestal will break this algorithm . For current fill the time histogram is always filled 
+	     if pedestal > threshold. For current+prior fill the PU time histogram is always filled if pedestal > threshold / 2.
+	     
+	  */
 
-      hFlush2D[ih]->Fill( ib+1, *(h_fillSumArray+i));
-      hFlush2DCoarse[ih]->Fill( ib+1, *(h_fillSumArray+i));
-      //fprintf(fp, " %i %f\n", i+1, *(h_fillSumArray+i) );      
-    }
+	  PUadd1 = ydiff;
+	  if (j > 0) {
+	    PUadd2 = hLastFlush1D[ih*nthresholds + it]->GetBinContent( ib+1 ); // get sample from previous flush at same fill time
+	  } else {
+            PUadd2 = 0.0; // dont get sample from previous fill for first flush
+	  }
+	  PUsub = PUadd1 + PUadd2;
+          PUcorr = 0;
+	  if (PUadd1 >= it*threshold) {
+	    hPUFlush1D[ih*nthresholds + it]->AddBinContent( ib+1, PUadd1 );
+            PUcorr += PUadd1;
+	  } 
 
-    // make xtal-summmed distributions
+ 	  if (PUadd2 >= it*threshold) {
+	    hPUFlush1D[ih*nthresholds + it]->AddBinContent( ib+1, PUadd2 );
+            PUcorr += PUadd2;
+	  } 
+	  if (PUsub  >= it*threshold) {
+	    hPUFlush1D[ih*nthresholds + it]->AddBinContent( ib+1, -PUsub );
+            PUcorr -= PUsub;
+	  } 
+	  /*
+	  if (j> 0 && it == 1 && PUadd1 >= 1. && PUadd2 >= 1. ) { // not first flush, when pileup correction for it=1 threshold
+	    printf("fill j %i, seg ih %i, thres %i, bin ib %i,  PUsub %f, PUadd1 (current) %f, PUadd2 (previous) %f, PU correction %f\n", 
+	    j, ih, it, ib,  PUsub, PUadd1, PUadd2, PUcorr);
+	  }
+	  */
+
+	  if (it > 0) {
+	    if ( ydiff >= it*threshold) { // for above threshold pulses
+
+	      hFlush1D[ih*nthresholds + it]->Fill( ib+1, ydiff); // fill the finite-threshold Q-method histogram
+	      hStats1D[ih*nthresholds + it]->Fill( ib+1, 1); // fill the finite-threshold statistics histogram
+	    } else {
+
+	      hFlush1Dlost[ih*nthresholds + it]->Fill( ib+1, ydiff); // fill the below threshold histogram
+	    }
+	  } else { 
+
+	    hFlush1D[ih*nthresholds + it]->Fill( ib+1, *(h_fillSumArray+i));  // special handling of zero-threshold histogram
+	  } // it > 0, it = 0 procesing
+ 
+
+	    // update  last, next-last flush histogram on last bin of bookended histogram ib-kmin 
+	  if ( ib == fill_buffer_max_length-kmax-1 ) {
+   
+	    hNextLastFlush1D[ih*nthresholds + it]->Reset();
+	    hNextLastFlush1D[ih*nthresholds + it]->Add( hLastFlush1D[ih*nthresholds + it], 1.0);
+	    hLastFlush1D[ih*nthresholds + it]->Reset();
+	    hLastFlush1D[ih*nthresholds + it]->Add( htmp[ih*nthresholds + it], 1.0);
+            //if (it==1) printf("reset+fill last, next-last flush %i, ih %i, it %i, last integral %f, next last integral %f\n", 
+	    //	   j, ih, it, hLastFlush1D[ih*nthresholds + it]->Integral(), hNextLastFlush1D[ih*nthresholds + it]->Integral() );
+	  }
+
+	  // update tmp histogram
+	  if ( ib-kmin == 0 ) {
+            //if (it==1) printf("before reset tmp %i, ih %i, it %i, last integral %f, next last integral %f\n",
+	    //	   j, ih, it, htmp[ih*nthresholds + it]->Integral());
+	    htmp[ih*nthresholds + it]->Reset();
+            //if (it==0) printf("after reset tmp %i, ih %i, it %i, last integral %f, next last integral %f\n",
+	    //	   j, ih, it, htmp[ih*nthresholds + it]->Integral());
+	  }
+	  if (it > 0) {
+
+	    if ( ydiff >= it*threshold) { // for above threshold histograms
+
+	      htmp[ih*nthresholds + it]->SetBinContent( ib+1, ydiff);
+	      //if ( it == 1 ) printf("fill PU histogram, flush j %i, seg ih %i, thres %i, bin ib %i,  ydiff %f\n", j, ih, it, ib, ydiff);
+	    } 
+	  } else { // for zero threshold histogram
+
+	      htmp[ih*nthresholds + it]->SetBinContent( ib+1, ydiff);
+	  }
+	  
+	  //hFlush2D[ih]->Fill( ib+1, *(h_fillSumArray+i));
+	  //hFlush2DCoarse[ih]->Fill( ib+1, *(h_fillSumArray+i));
+	  //fprintf(fp, " %i %f\n", i+1, *(h_fillSumArray+i) );
+	  
+	} // book ending if statement
+	
+      } // loop over thresholds
+
+    } // loop over array elements i = segments x samples
+    
+      // make xtal-summmed distributions
     for (int ib = 0; ib < fill_buffer_max_length; ib++){
-
+      
       float sum = 0.0;
       for (int is = 0; is < nsegs; is++){
 	sum += *(h_fillSumArray + is*fill_buffer_max_length + ib);
       }
-
+      
       hFlush2DSum->Fill( ib+1, sum);
       hFlush2DCoarseSum->Fill( ib+1, sum);
     }
+    
+      // fill diagnostic hit distribution
+      for (int ib = 0; ib < fill_buffer_max_length; ib++){
+	hHits1D->Fill( ib+1, *(h_hitSumArray+ib));
+      }
+      
+      // fill diagnostic hit distribution
+      for (int ib = 0; ib < fill_buffer_max_length; ib++){
+	hPUHits1D->Fill( ib+1, *(h_PUhitSumArray+ib));
+      }
+      
+      // fill diagnostic energy distribution
+      for (int ib = 0; ib < energybins; ib++){
+	hEnergy1D->Fill( ib+1, *(h_energySumArray+ib));
+      }
+      
+      // fill diagnostic PU energy distribution
+      for (int ib = 0; ib < energybins; ib++){
+	hPUlostEnergy1D->Fill( ib+1, *(h_PUlostenergySumArray+ib));
+      }
+      
+      // fill diagnostic PU energy distribution
+      for (int ib = 0; ib < energybins; ib++){
+	hPUgainEnergy1D->Fill( ib+1, *(h_PUgainenergySumArray+ib));
+      }
+
+  } // loop over flushes
   
-    // fill diagnostic hit distribution
-    for (int ib = 0; ib < fill_buffer_max_length; ib++){
-      hHits1D->Fill( ib+1, *(h_hitSumArray+ib));
-    }
-
-    // fill diagnostic hit distribution
-    for (int ib = 0; ib < fill_buffer_max_length; ib++){
-      hPUHits1D->Fill( ib+1, *(h_PUhitSumArray+ib));
-    }
-
-    // fill diagnostic energy distribution
-    for (int ib = 0; ib < energybins; ib++){
-      hEnergy1D->Fill( ib+1, *(h_energySumArray+ib));
-    }
-
-    // fill diagnostic PU energy distribution
-    for (int ib = 0; ib < energybins; ib++){
-      hPUlostEnergy1D->Fill( ib+1, *(h_PUlostenergySumArray+ib));
-    }
-
-    // fill diagnostic PU energy distribution
-    for (int ib = 0; ib < energybins; ib++){
-      hPUgainEnergy1D->Fill( ib+1, *(h_PUgainenergySumArray+ib));
-    }
-
-  }
-
   // free device arrays
   cudaFree(d_state);
   cudaFree(d_state2);
@@ -1045,16 +1210,22 @@ int main(int argc, char * argv[]){
       
       sprintf( hname, "h%02i_%02i", ih, it);
       f->WriteObject( hFlush1D[ih*nthresholds + it], hname);
+      sprintf( hname, "hPU%02i_%02i", ih, it);
+      f->WriteObject( hPUFlush1D[ih*nthresholds + it], hname);
+      sprintf( hname, "hLastFlush%02i_%02i", ih, it);
+      f->WriteObject( hLastFlush1D[ih*nthresholds + it], hname);
+      sprintf( hname, "hNextLastFlush%02i_%02i", ih, it);
+      f->WriteObject( hNextLastFlush1D[ih*nthresholds + it], hname);
       sprintf( hname, "hStats%02i_%02i", ih, it);
       f->WriteObject( hStats1D[ih*nthresholds + it], hname);
       sprintf( hname, "hlost%02i_%02i", ih, it);
       f->WriteObject( hFlush1Dlost[ih*nthresholds + it], hname);
     }
 
-    sprintf( hname, "s%02i", ih);
-    f->WriteObject( hFlush2D[ih], hname);
-    sprintf( hname, "sc%02i", ih);
-    f->WriteObject( hFlush2DCoarse[ih], hname);
+    //sprintf( hname, "s%02i", ih);
+    //f->WriteObject( hFlush2D[ih], hname);
+    //sprintf( hname, "sc%02i", ih);
+    //f->WriteObject( hFlush2DCoarse[ih], hname);
   }
 
   sprintf( hname, "hHits");
